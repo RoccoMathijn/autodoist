@@ -860,8 +860,7 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
 
                                 try:
                                     item_due_date = item['due']['date']
-                                    item_due_date = datetime.strptime(
-                                        item_due_date, '%Y-%m-%d')
+                                    item_due_date = datetime.fromisoformat(item_due_date)
                                 except:
                                     logging.warning(
                                         'No due date to determine start date for item: "%s".', item['content'])
