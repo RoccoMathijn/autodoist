@@ -590,6 +590,11 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
         project_items = api.items.all(
             lambda x: x['project_id'] == project['id'])
 
+        # Add 'Define next action item' to empty projects
+        child_projects = api.projects.all(lambda x: x['parent_id'] == project['id'])
+        if project_type and not project_items and not child_projects:
+          api.items.add('Define next action', project_id = project_id)
+
         # Run for both none-sectioned and sectioned items
         for s in [0, 1]:
             if s == 0:
