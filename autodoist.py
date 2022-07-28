@@ -8,6 +8,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta
 import time
+from dateutil import parser, tz
 
 # Makes --help text wider
 
@@ -561,6 +562,10 @@ def run_recurring_lists_logic(args, api, item, child_items, child_items_all, reg
 
 def autodoist_magic(args, api, label_id, regen_labels_id):
 
+    # Retrieve timezone from settings
+    user = api.user.get()
+    user_timezone = tz.gettz(user['tz_info']['timezone'])
+  
     # Preallocate dictionaries
     overview_item_ids = {}
     overview_item_labels = {}
@@ -860,8 +865,8 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
 
                                 try:
                                     item_due_date = item['due']['date']
-                                    item_due_date = datetime.strptime(
-                                        item_due_date, '%Y-%m-%d')
+                                    item_due_date = parser.parse(item_due_date)
+                                      
                                 except:
                                     logging.warning(
                                         'No due date to determine start date for item: "%s".', item['content'])
@@ -872,10 +877,18 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
                                 elif f2 > -1:
                                     td = timedelta(weeks=int(offset))
 
+                                # If item has a timezone specified use that, fallback to the timezone from user settings otherwise
+                                item_timezone = item['due']['timezone']
+                                if (item_timezone):
+                                  item_due_date = item_due_date.astimezone(tz.gettz(item_timezone))
+                                else:
+                                  item_due_date = item_due_date.replace(tzinfo = user_timezone)  
+                                
                                 # If we're not in the offset from the due date yet, remove all labels
-                                start_date = item_due_date - td
-                                future_diff = (
-                                    datetime.today()-start_date).days
+                                start_date = item_due_date - td  
+                                today = datetime.today().astimezone(user_timezone)
+                                future_diff = (today-start_date).days
+
                                 if future_diff < 0:
                                     remove_label(
                                         item, label_id, overview_item_ids, overview_item_labels)
