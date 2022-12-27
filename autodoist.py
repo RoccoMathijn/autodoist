@@ -1,13 +1,13 @@
 #!/usr/bin/python3
 
-from todoist.api import TodoistAPI
-import sys
-import time
-import requests
 import argparse
 import logging
-from datetime import datetime, timedelta
+import sys
 import time
+from datetime import datetime, timedelta
+
+import requests
+from todoist_api_python.api import TodoistAPI
 
 # Makes --help text wider
 
@@ -24,17 +24,6 @@ def make_wide(formatter, w=120, h=36):
         logging.error("Argparse help formatter failed, falling back.")
         return formatter
 
-# Sync with Todoist API
-
-
-def sync(api):
-    try:
-        logging.debug('Syncing the current state from the API')
-        api.sync()
-    except Exception as e:
-        logging.exception(
-            'Error trying to sync with Todoist API: %s' % str(e))
-        quit()
 
 # Simple query for yes/no answer
 
@@ -76,12 +65,11 @@ def query_yes_no(question, default="yes"):
 
 def verify_label_existance(args, api, label_name, prompt_mode):
     # Check the regeneration label exists
-    label = api.labels.all(lambda x: x['name'] == label_name)
+    label = next((label for label in api.get_labels() if label.name == label_name), None)
 
-    if len(label) > 0:
-        label_id = label[0]['id']
-        logging.debug('Label \'%s\' found as label id %d',
-                      args.label, label_id)
+    if label:
+        logging.debug('Label \'%s\' found as label id %s',
+                      args.label, label.id)
     else:
         # Create a new label in Todoist
         logging.info(
@@ -94,17 +82,13 @@ def verify_label_existance(args, api, label_name, prompt_mode):
             response = True
 
         if response:
-            api.labels.add(label_name)
-            api.commit()
-            api.sync()
-            label = api.labels.all(lambda x: x['name'] == label_name)
-            label_id = label[0]['id']
+            label = api.add_label(label_name)
             logging.info("Label '{}' has been created!".format(label_name))
         else:
             logging.info('Exiting Autodoist.')
             exit(1)
 
-    return label_id
+    return label.id
 
 
 # Initialisation of Autodoist
@@ -148,41 +132,18 @@ def initialise(args):
             "\n No functionality has been enabled. Please see --help for the available options.\n")
         exit(0)
 
-    # Run the initial sync
-    logging.debug('Connecting to the Todoist API')
-
     api_arguments = {'token': args.api_key}
-    if args.nocache:
-        logging.debug('Disabling local caching')
-        api_arguments['cache'] = None
-
     api = TodoistAPI(**api_arguments)
-    sync(api)
 
     # If labeling argument is used
     if args.label is not None:
 
         # Verify that the next action label exists; ask user if it needs to be created
-        label_id = verify_label_existance(args, api, args.label, 1)
-
-    else:
-        # Label functionality not needed
-        label_id = None
+        verify_label_existance(args, api, args.label, 1)
 
     logging.info("Autodoist has connected and is running fine!\n")
 
-    # If regeneration mode is used, verify labels
-    if args.regeneration is not None:
-
-        # Verify the existance of the regeneraton labels; force creation of label
-        regen_labels_id = [verify_label_existance(
-            args, api, regen_label, 2) for regen_label in args.regen_label_names]
-
-    else:
-        # Label functionality not needed
-        regen_labels_id = [None, None, None]
-
-    return api, label_id, regen_labels_id
+    return api
 
 # Check for Autodoist update
 
@@ -252,39 +213,26 @@ def get_type(args, object, key):
     object_name = ''
 
     try:
-        old_type = object[key]
-    except:
-        # logging.debug('No defined project_type: %s' % str(e))
-        old_type = None
-
-    try:
-        object_name = object['name'].strip()
+        object_name = object.name.strip()
     except:
         try:
-            object_name = object['content'].strip()
+            object_name = object.content.strip()
         except:
             pass
 
     current_type = check_name(args, object_name)
 
-    # Check if project type changed with respect to previous run
-    if old_type == current_type:
-        type_changed = 0
-    else:
-        type_changed = 1
-        object[key] = current_type
-
-    return current_type, type_changed
+    return current_type
 
 # Determine a project type
 
 
 def get_project_type(args, project_object):
     """Identifies how a project should be handled."""
-    project_type, project_type_changed = get_type(
+    project_type = get_type(
         args, project_object, 'project_type')
 
-    return project_type, project_type_changed
+    return project_type
 
 # Determine a section type
 
@@ -292,81 +240,79 @@ def get_project_type(args, project_object):
 def get_section_type(args, section_object):
     """Identifies how a section should be handled."""
     if section_object is not None:
-        section_type, section_type_changed = get_type(
+        section_type = get_type(
             args, section_object, 'section_type')
     else:
         section_type = None
-        section_type_changed = 0
 
-    return section_type, section_type_changed
+    return section_type
 
 # Determine an item type
 
 
-def get_item_type(args, item, project_type):
+def get_item_type(args, item, items):
     """Identifies how an item with sub items should be handled."""
 
-    if project_type is None and item['parent_id'] != 0:
-        try:
-            item_type = item['parent_type']
-            item_type_changed = 1
-            item['item_type'] = item_type
-        except:
-            item_type, item_type_changed = get_type(args, item, 'item_type')
-    else:
-        item_type, item_type_changed = get_type(args, item, 'item_type')
-
-    return item_type, item_type_changed
+    item_type = get_type(args, item, 'item_type')
+    if not item_type and item.parent_id:
+      try:
+          parent = [parent for parent in items if parent.id == item.parent_id][0]
+          item_type = get_item_type(args, parent, items)
+      except:
+        pass
+    return item_type
 
 # Logic to add a label to an item
 
 
 def add_label(item, label, overview_item_ids, overview_item_labels):
-    if label not in item['labels']:
-        labels = item['labels']
-        logging.debug('Updating \'%s\' with label', item['content'])
+    if label not in item.labels:
+        labels = item.labels
+        logging.debug('Updating \'%s\' with label', item.content)
         labels.append(label)
 
         try:
-            overview_item_ids[str(item['id'])] += 1
+            overview_item_ids[item.id] += 1
         except:
-            overview_item_ids[str(item['id'])] = 1
-        overview_item_labels[str(item['id'])] = labels
+            overview_item_ids[item.id] = 1
+        overview_item_labels[item.id] = labels
 
 # Logic to remove a label from an item
 
 
 def remove_label(item, label, overview_item_ids, overview_item_labels):
-    if label in item['labels']:
-        labels = item['labels']
-        logging.debug('Removing \'%s\' of its label', item['content'])
+    if label in item.labels:
+        labels = item.labels
+        logging.debug('Removing \'%s\' of its label', item.content)
         labels.remove(label)
 
         try:
-            overview_item_ids[str(item['id'])] -= 1
+            overview_item_ids[item.id] -= 1
         except:
-            overview_item_ids[str(item['id'])] = -1
-        overview_item_labels[str(item['id'])] = labels
+            overview_item_ids[item.id] = -1
+        overview_item_labels[item.id] = labels
 
 # Ensure labels are only issued once per item
 
 
-def update_labels(api, label_id, overview_item_ids, overview_item_labels):
+def update_labels(api, overview_item_ids, overview_item_labels):
     filtered_overview_ids = [
         k for k, v in overview_item_ids.items() if v != 0]
     for item_id in filtered_overview_ids:
         labels = overview_item_labels[item_id]
-        api.items.update(item_id, labels=labels)
+        api.update_task(task_id=item_id, labels=labels)
 
 # To handle items which have no sections
 
 
 def create_none_section():
-    none_sec = {
+    from todoist_api_python.models import Section
+    none_sec = Section.from_dict({
         'id': None,
         'name': 'None',
-        'section_order': 0
-    }
+        'order': 0,
+        'project_id': 0
+    })
     return none_sec
 
 # Check if header logic needs to be applied
@@ -378,11 +324,11 @@ def check_header(level):
     method = 0
 
     try:
-        name = level['name']
+        name = level.name
         method = 1
     except:
         try:
-            content = level['content']
+            content = level.content
             method = 2
         except:
             pass
@@ -409,69 +355,61 @@ def check_header(level):
 # Check regen mode based on label name
 
 
-def check_regen_mode(api, item, regen_labels_id):
+def check_regen_mode(api, item, regen_label_names):
 
-    labels = item['labels']
+    labels = item.labels
 
-    overlap = set(labels) & set(regen_labels_id)
+    overlap = set(labels) & set(regen_label_names)
     overlap = [val for val in overlap]
 
     if len(overlap) > 1:
         logging.warning(
-            'Multiple regeneration labels used! Please pick only one for item: "{}".'.format(item['content']))
+            'Multiple regeneration labels used! Please pick only one for item: "{}".'.format(item.content))
         return None
 
     try:
-        regen_label_id = overlap[0]
+        regen_label_name = overlap[0]
     except:
         logging.debug(
-            'No regeneration label for item: %s' % item['content'])
-        regen_label_id = [0]
+            'No regeneration label for item: %s' % item.content)
+        regen_label_name = [0]
 
-    if regen_label_id == regen_labels_id[0]:
-        return 0
-    elif regen_label_id == regen_labels_id[1]:
-        return 1
-    elif regen_label_id == regen_labels_id[2]:
-        return 2
-    else:
-        # label_name = api.labels.get_by_id(regen_label_id)['name']
-        # logging.debug(
-            # 'No regeneration label for item: %s' % item['content'])
-        return None
-
+    try:
+      return regen_label_names.index(regen_label_name)
+    except:
+      return None
 
 # Recurring lists logic
 
 
-def run_recurring_lists_logic(args, api, item, child_items, child_items_all, regen_labels_id):
+def run_recurring_lists_logic(args, api, item, child_items, child_items_all, regen_label_names):
 
-    if item['parent_id'] == 0:
+    if not item.parent_id:
         try:
-            if item['due']['is_recurring']:
+            if item.due.is_recurring:
                 try:
                     # Check if the T0 task date has changed
-                    if item['due']['date'] != item['date_old']:
+                    if item.due.date != item.date_old:
 
                         # Save the new date for reference us
                         item.update(
-                            date_old=item['due']['date'])
+                            date_old=item.due.date)
 
                         # Mark children for action based on mode
                         if args.regeneration is not None:
 
                             # Check if task has a regen label
                             regen_mode = check_regen_mode(
-                                api, item, regen_labels_id)
+                                api, item, regen_label_names)
 
                             # If no label, use general mode instead
                             if regen_mode is None:
                                 regen_mode = args.regeneration
                                 logging.debug('Using general recurring mode \'%s\' for item: %s',
-                                    regen_mode, item['content'])
+                                    regen_mode, item.content)
                             else:
                                 logging.debug('Using recurring label \'%s\' for item: %s',
-                                    regen_mode, item['content'])
+                                    regen_mode, item.content)
 
                             # Apply tags based on mode
                             give_regen_tag = 0
@@ -541,10 +479,10 @@ def run_recurring_lists_logic(args, api, item, child_items, child_items_all, reg
             #     'Parent not recurring: %s' % item['content'])
             pass
 
-    if args.regeneration is not None and item['parent_id'] != 0:
+    if args.regeneration is not None and item.parent_id:
         try:
             if item['r_tag'] == 1:
-                item.update(checked=0)
+                item.update(is_completed)
                 item.update(in_history=0)
                 item['r_tag'] = 0
                 api.items.update(item['id'])
@@ -559,13 +497,17 @@ def run_recurring_lists_logic(args, api, item, child_items, child_items_all, reg
 # Contains all main autodoist functionalities
 
 
-def autodoist_magic(args, api, label_id, regen_labels_id):
+def autodoist_magic(args, api, next_action_label, regen_label_names):
 
     # Preallocate dictionaries
     overview_item_ids = {}
     overview_item_labels = {}
 
-    for project in api.projects.all():
+    tasks = api.get_tasks()
+    sections = api.get_sections()
+    projects = api.get_projects()
+
+    for project in projects:
 
         # To determine if a sequential task was found
         first_found_project = False
@@ -573,27 +515,23 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
         # Check if we need to (un)header entire project
         header_all_in_p, unheader_all_in_p = check_header(project)
 
-        if label_id is not None:
+        if next_action_label is not None:
             # Get project type
-            project_type, project_type_changed = get_project_type(
-                args, project)
+            project_type = get_project_type(args, project)
             if project_type is not None:
-                logging.debug('Identified \'%s\' as %s type',
-                            project['name'], project_type)
+                logging.debug('Identified \'%s\' as %s type', project.name, project_type)
 
         # Get all items for the project
-        project_items = api.items.all(
-            lambda x: x['project_id'] == project['id'])
+        project_items = [task for task in tasks if task.project_id == project.id]
 
         # Run for both none-sectioned and sectioned items
         for s in [0, 1]:
             if s == 0:
-                sections = [create_none_section()]
+                project_sections = [create_none_section()]
             elif s == 1:
-                sections = api.sections.all(
-                    lambda x: x['project_id'] == project['id'])
+                project_sections = [section for section in sections if section.project_id == project.id]
 
-            for section in sections:
+            for section in project_sections:
 
                 # Check if we need to (un)header entire secion
                 header_all_in_s, unheader_all_in_s = check_header(section)
@@ -602,68 +540,46 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
                 first_found_section = False
 
                 # Get section type
-                section_type, section_type_changed = get_section_type(
-                    args, section)
+                section_type = get_section_type(args, section)
                 if section_type is not None:
                     logging.debug('Identified \'%s\' as %s type',
-                                section['name'], section_type)
+                                section.name, section_type)
 
                 # Get all items for the section
-                items = [x for x in project_items if x['section_id']
-                         == section['id']]
-
-                # Change top parents_id in order to sort later on
-                for item in items:
-                    if not item['parent_id']:
-                        item['parent_id'] = 0
+                items = [x for x in project_items if x.section_id == section.id]
 
                 # Sort by parent_id and filter for completable items
                 items = sorted(items, key=lambda x: (
-                    x['parent_id'], x['child_order']))
-
-                # If a type has changed, clean label for good measure
-                if label_id is not None:
-                    if project_type_changed == 1 or section_type_changed == 1:
-                        # Remove labels
-                        [remove_label(item, label_id, overview_item_ids,
-                                      overview_item_labels) for item in items]
-                        # Remove parent types
-                        for item in items:
-                            item['parent_type'] = None
+                    int(x.parent_id or "0"), x.order))
 
                 # For all items in this section
                 for item in items:
                     active_type = None  # Reset
 
-                    # Possible nottes routine for the future
-                    # notes = api.notes.all() TODO: Quick notes test to see what the impact is?
-                    # note_content = [x['content'] for x in notes if x['item_id'] == item['id']]
-                    # print(note_content)
-
-                    # Determine which child_items exist, both all and the ones that have not been checked yet
-                    non_checked_items = list(
-                        filter(lambda x: x['checked'] == 0, items))
+                    # Determine which child_items exist, both all and the ones that have not been completed yet
+                    non_completed_tasks = list(
+                        filter(lambda x: not x.is_completed, items))
                     child_items_all = list(
-                        filter(lambda x: x['parent_id'] == item['id'], items))
+                        filter(lambda x: x.parent_id == item.id, items))
                     child_items = list(
-                        filter(lambda x: x['parent_id'] == item['id'], non_checked_items))
+                        filter(lambda x: x.parent_id == item.id, non_completed_tasks))
 
                     # Check if we need to (un)header entire item tree
                     header_all_in_i, unheader_all_in_i = check_header(item)
 
                     # Logic for applying and removing headers
                     if any([header_all_in_p, header_all_in_s, header_all_in_i]):
-                        if item['content'][0] != '*':
-                            item.update(content='* ' + item['content'])
+                        if item.content[0] != '*':
+                            item.update(content='* ' + item.content)
                             for ci in child_items:
-                                if not ci['content'].startswith('*'):
-                                    ci.update(content='* ' + ci['content'])
+                                if not ci.content.startswith('*'):
+                                    ci.update(content='* ' + ci.content)
 
                     if any([unheader_all_in_p, unheader_all_in_s]):
-                        if item['content'][0] == '*':
-                            item.update(content=item['content'][2:])
+                        if item.content[0] == '*':
+                            item.update(content=item.content[2:])
                     if unheader_all_in_i:
-                        [ci.update(content=ci['content'][2:])
+                        [ci.update(content=ci.content[2:])
                          for ci in child_items]
 
                     # Logic for recurring lists
@@ -679,135 +595,117 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
                     # If options turned on, start recurring lists logic
                     if args.regeneration is not None or args.end:
                         run_recurring_lists_logic(
-                            args, api, item, child_items, child_items_all, regen_labels_id)
+                            args, api, item, child_items, child_items_all, regen_label_names)
 
                     # If options turned on, start labelling logic
-                    if label_id is not None:
-                        # Skip processing an item if it has already been checked or is a header
-                        if item['checked'] == 1:
+                    if next_action_label is not None:
+                        # Skip processing an item if it has already been completed or is a header
+                        if item.is_completed:
                             continue
-                        if item['content'].startswith('*'):
+                        if item.content.startswith('*'):
                             # Remove next action label if it's still present
-                            remove_label(item, label_id, overview_item_ids,overview_item_labels)
+                            remove_label(item, next_action_label, overview_item_ids, overview_item_labels)
                             continue
 
                         # Check item type
-                        item_type, item_type_changed = get_item_type(
-                            args, item, project_type)
+                        item_type = get_item_type(args, item, items)
                         if item_type is not None:
                             logging.debug('Identified \'%s\' as %s type',
-                                        item['content'], item_type)
+                                        item.content, item_type)
 
                         # Determine hierarchy types for logic
-                        hierarchy_types = [item_type,
-                                           section_type, project_type]
-                        active_types = [type(x) != type(None)
-                                        for x in hierarchy_types]
+                        hierarchy_types = [item_type, section_type, project_type]
 
                         # If it is a parentless task
-                        if item['parent_id'] == 0:
-                            if active_types[0]:
+                        if not item.parent_id:
+                            if hierarchy_types[0]:
                                 # Do item types
                                 active_type = item_type
                                 add_label(
-                                    item, label_id, overview_item_ids, overview_item_labels)
+                                    item, next_action_label, overview_item_ids, overview_item_labels)
 
-                            elif active_types[1]:
+                            elif hierarchy_types[1]:
                                 # Do section types
                                 active_type = section_type
 
                                 if section_type == 'sequential' or section_type == 's-p':
                                     if not first_found_section:
                                         add_label(
-                                            item, label_id, overview_item_ids, overview_item_labels)
+                                            item, next_action_label, overview_item_ids, overview_item_labels)
                                         first_found_section = True
                                 elif section_type == 'parallel' or section_type == 'p-s':
                                     add_label(
-                                        item, label_id, overview_item_ids, overview_item_labels)
+                                        item, next_action_label, overview_item_ids, overview_item_labels)
 
-                            elif active_types[2]:
+                            elif hierarchy_types[2]:
                                 # Do project types
                                 active_type = project_type
 
                                 if project_type == 'sequential' or project_type == 's-p':
                                     if not first_found_project:
                                         add_label(
-                                            item, label_id, overview_item_ids, overview_item_labels)
+                                            item, next_action_label, overview_item_ids, overview_item_labels)
                                         first_found_project = True
 
                                 elif project_type == 'parallel' or project_type == 'p-s':
                                     add_label(
-                                        item, label_id, overview_item_ids, overview_item_labels)
+                                        item, next_action_label, overview_item_ids, overview_item_labels)
 
                             # Mark other conditions too
-                            if first_found_section == False and active_types[1]:
+                            if first_found_section == False and hierarchy_types[1]:
                                 first_found_section = True
-                            if first_found_project is False and active_types[2]:
+                            if first_found_project is False and hierarchy_types[2]:
                                 first_found_project = True
 
                         # If there are children
                         if len(child_items) > 0:
-                            # Check if item state has changed, if so clean children for good measure
-                            if item_type_changed == 1:
-                                [remove_label(child_item, label_id, overview_item_ids, overview_item_labels)
-                                    for child_item in child_items]
-
-                            # If a sub-task, inherit parent task type
-                            if item['parent_id'] !=0:
-                                try:
-                                    active_type = item['parent_type']      
-                                except:
-                                    pass 
                             
+                            active_type = next(filter(lambda x: x is not None, hierarchy_types), None)
                             # Process sequential tagged items (item_type can overrule project_type)
                             if active_type == 'sequential' or active_type == 'p-s':
                                 for child_item in child_items:
                                     
                                     # Ignore headered children
-                                    if child_item['content'].startswith('*'):
+                                    if child_item.content.startswith('*'):
                                         continue
 
-                                    # Pass item_type down to the children
-                                    child_item['parent_type'] = active_type
                                     # Pass label down to the first child
-                                    if child_item['checked'] == 0 and label_id in item['labels']:
+                                    if not child_item.is_completed and next_action_label in item.labels:
                                         add_label(
-                                            child_item, label_id, overview_item_ids, overview_item_labels)
+                                            child_item, next_action_label, overview_item_ids, overview_item_labels)
                                         remove_label(
-                                            item, label_id, overview_item_ids, overview_item_labels)
+                                            item, next_action_label, overview_item_ids, overview_item_labels)
                                     else:
                                         # Clean for good measure
                                         remove_label(
-                                            child_item, label_id, overview_item_ids, overview_item_labels)
+                                            child_item, next_action_label, overview_item_ids, overview_item_labels)
 
                             # Process parallel tagged items or untagged parents
-                            elif active_type == 'parallel' or (active_type == 's-p' and label_id in item['labels']):
+                            elif active_type == 'parallel' or (item_type == 's-p' and next_action_label in item.labels):
                                 remove_label(
-                                    item, label_id, overview_item_ids, overview_item_labels)
+                                    item, next_action_label, overview_item_ids, overview_item_labels)
                                 for child_item in child_items:
 
                                     # Ignore headered children
-                                    if child_item['content'].startswith('*'):
+                                    if child_item.content.startswith('*'):
                                         continue
 
-                                    child_item['parent_type'] = active_type
-                                    if child_item['checked'] == 0:
-                                        # child_first_found = True
+                                    if not child_item.is_completed:
                                         add_label(
-                                            child_item, label_id, overview_item_ids, overview_item_labels)
+                                            child_item, next_action_label, overview_item_ids, overview_item_labels)
 
                         # Remove labels based on start / due dates
 
                         # If item is too far in the future, remove the next_action tag and skip
                         try:
-                            if args.hide_future > 0 and 'due' in item.data and item['due'] is not None:
+                            if args.hide_future > 0 and 'due' in item.data and item.due is not None:
                                 due_date = datetime.strptime(
-                                    item['due']['date'], "%Y-%m-%d")
+                                    item.due.date, "%Y-%m-%d")
                                 future_diff = (
                                     due_date - datetime.today()).days
                                 if future_diff >= args.hide_future:
                                     remove_label(
-                                        item, label_id, overview_item_ids, overview_item_labels)
+                                        item, next_action_label, overview_item_ids, overview_item_labels)
                                     continue
                         except:
                             # Hide-future not set, skip
@@ -815,56 +713,56 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
 
                         # If start-date has not passed yet, remove label
                         try:
-                            f1 = item['content'].find('start=')
-                            f2 = item['content'].find('start=due-')
+                            f1 = item.content.find('start=')
+                            f2 = item.content.find('start=due-')
                             if f1 > -1 and f2 == -1:
-                                f_end = item['content'][f1+6:].find(' ')
+                                f_end = item.content[f1+6:].find(' ')
                                 if f_end > -1:
-                                    start_date = item['content'][f1 +
+                                    start_date = item.content[f1 +
                                                                  6:f1+6+f_end]
                                 else:
-                                    start_date = item['content'][f1+6:]
+                                    start_date = item.content[f1+6:]
 
-                                # If start-date hasen't passed, remove all labels
+                                # If start-date hasn't passed, remove all labels
                                 start_date = datetime.strptime(
                                     start_date, args.dateformat)
                                 future_diff = (
                                     datetime.today()-start_date).days
                                 if future_diff < 0:
                                     remove_label(
-                                        item, label_id, overview_item_ids, overview_item_labels)
-                                    [remove_label(child_item, label_id, overview_item_ids,
+                                        item, next_action_label, overview_item_ids, overview_item_labels)
+                                    [remove_label(child_item, next_action_label, overview_item_ids,
                                                   overview_item_labels) for child_item in child_items]
                                     continue
 
                         except:
                             logging.warning(
-                                'Wrong start-date format for item: "%s". Please use "start=<DD-MM-YYYY>"', item['content'])
+                                'Wrong start-date format for item: "%s". Please use "start=<DD-MM-YYYY>"', item.content)
                             continue
 
                         # Recurring task friendly - remove label with relative change from due date
                         try:
-                            f = item['content'].find('start=due-')
+                            f = item.content.find('start=due-')
                             if f > -1:
-                                f1a = item['content'].find(
+                                f1a = item.content.find(
                                     'd')  # Find 'd' from 'due'
-                                f1b = item['content'].rfind(
+                                f1b = item.content.rfind(
                                     'd')  # Find 'd' from days
-                                f2 = item['content'].find('w')
-                                f_end = item['content'][f+10:].find(' ')
+                                f2 = item.content.find('w')
+                                f_end = item.content[f+10:].find(' ')
 
                                 if f_end > -1:
-                                    offset = item['content'][f+10:f+10+f_end-1]
+                                    offset = item.content[f+10:f+10+f_end-1]
                                 else:
-                                    offset = item['content'][f+10:-1]
+                                    offset = item.content[f+10:-1]
 
                                 try:
-                                    item_due_date = item['due']['date']
+                                    item_due_date = item.due.date
                                     item_due_date = datetime.strptime(
                                         item_due_date, '%Y-%m-%d')
                                 except:
                                     logging.warning(
-                                        'No due date to determine start date for item: "%s".', item['content'])
+                                        'No due date to determine start date for item: "%s".', item.content)
                                     continue
 
                                 if f1a != f1b and f1b > -1:  # To make sure it doesn't trigger if 'w' is chosen
@@ -878,14 +776,14 @@ def autodoist_magic(args, api, label_id, regen_labels_id):
                                     datetime.today()-start_date).days
                                 if future_diff < 0:
                                     remove_label(
-                                        item, label_id, overview_item_ids, overview_item_labels)
-                                    [remove_label(child_item, label_id, overview_item_ids,
+                                        item, next_action_label, overview_item_ids, overview_item_labels)
+                                    [remove_label(child_item, next_action_label, overview_item_ids,
                                                   overview_item_labels) for child_item in child_items]
                                     continue
 
                         except:
                             logging.warning(
-                                'Wrong start-date format for item: %s. Please use "start=due-<NUM><d or w>"', item['content'])
+                                'Wrong start-date format for item: %s. Please use "start=due-<NUM><d or w>"', item.content)
                             continue
 
     return overview_item_ids, overview_item_labels
@@ -910,7 +808,7 @@ def main():
     parser.add_argument(
         '-e', '--end', help='enable alternative end-of-day time instead of default midnight. Enter a number from 1 to 24 to define which hour is used.', type=int)
     parser.add_argument(
-        '-d', '--delay', help='specify the delay in seconds between syncs (default 5).', default=5, type=int)
+        '-d', '--delay', help='specify the delay in seconds between syncs (default 5).', default=10, type=int)
     parser.add_argument(
         '-pp', '--pp_suffix', help='change suffix for parallel-parallel labeling (default "//").', default='//')
     parser.add_argument(
@@ -956,33 +854,19 @@ def main():
     check_for_update(current_version)
 
     # Initialise api
-    api, label_id, regen_labels_id = initialise(args)
+    api = initialise(args)
 
     # Start main loop
     while True:
         start_time = time.time()
-        sync(api)
 
         # Evaluate projects, sections, and items
         overview_item_ids, overview_item_labels = autodoist_magic(
-            args, api, label_id, regen_labels_id)
+            args, api, args.label, args.regen_label_names)
 
         # Commit the queue with changes
-        if label_id is not None:
-            update_labels(api, label_id, overview_item_ids,
-                          overview_item_labels)
-
-        if len(api.queue):
-            len_api_q = len(api.queue)
-            api.commit()
-            if len_api_q == 1:
-                logging.info(
-                    '%d change committed to Todoist.', len_api_q)
-            else:
-                logging.info(
-                    '%d changes committed to Todoist.', len_api_q)
-        else:
-            logging.info('No changes in queue, skipping sync.')
+        if args.label is not None:
+            update_labels(api, overview_item_ids, overview_item_labels)
 
         # If onetime is set, exit after first execution.
         if args.onetime:
