@@ -681,7 +681,7 @@ def autodoist_magic(args, api, next_action_label, regen_label_names):
                                             child_item, next_action_label, overview_item_ids, overview_item_labels)
 
                             # Process parallel tagged items or untagged parents
-                            elif active_type == 'parallel' or (item_type == 's-p' and next_action_label in item.labels):
+                            elif active_type == 'parallel' or (active_type == 's-p' and next_action_label in item.labels):
                                 remove_label(
                                     item, next_action_label, overview_item_ids, overview_item_labels)
                                 for child_item in child_items:
